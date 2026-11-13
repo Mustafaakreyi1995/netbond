@@ -19,14 +19,14 @@ over it carry on over the others.
 **1. Server** (any Linux VPS, 1 CPU / 512 MB is enough). As root:
 
 ```
-curl -fsSL https://github.com/__REPO__/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/Mustafaakreyi1995/netbond/releases/latest/download/install.sh | bash
 ```
 
 It prints a connection code that starts with `netbond://`. Keep it private:
 anyone who has it can use your server.
 
 **2. Phone.** Download `NetBond.apk` from the
-[latest release](https://github.com/__REPO__/releases/latest), install it,
+[latest release](https://github.com/Mustafaakreyi1995/netbond/releases/latest), install it,
 paste the code, tap **Connect**, and accept Android's VPN prompt.
 
 Mobile data must be switched on. The app keeps it active alongside Wi-Fi.
