@@ -1,0 +1,9 @@
+android/app/libs/*.aar
+android/app/libs/*.jar
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+core/go.local.mod
+core/go.local.sum
+dist/

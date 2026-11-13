@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+      MOBILE_VERSION: 923679eb55af
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Resolve Go modules
+        working-directory: core
+        run: go mod tidy
+
+      - name: Test the bonding engine
+        working-directory: core
+        run: go test -count=1 ./...
+
+      - name: Build server binaries
+        working-directory: core
+        run: |
+          mkdir -p ../dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w" \
+              -o ../dist/netbond-server-linux-$arch ./cmd/netbond-server
+          done
+
+      - name: Build the Go core for Android
+        working-directory: core
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@$MOBILE_VERSION
+          go install golang.org/x/mobile/cmd/gobind@$MOBILE_VERSION
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          gomobile init
+          gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 26 \
+            -javapkg app.netbond.core -ldflags "-s -w" \
+            -o ../android/app/libs/bondcore.aar ./mobile
+
+      - name: Build the APK
+        working-directory: android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 1.0.${{ github.run_number }}
+        run: gradle --no-daemon assembleRelease
+
+      - name: Collect files
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk dist/NetBond.apk
+          sed "s|__REPO__|${{ github.repository }}|g" server/install.sh > dist/install.sh
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netbond
+          path: dist/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" dist/* \
+            --title "NetBond 1.0.${{ github.run_number }}" \
+            --notes "Phone: install NetBond.apk. Server: run install.sh (see README)." \
+            --latest
