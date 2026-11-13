@@ -24,7 +24,8 @@ type Callbacks interface {
 
 var (
 	mu     sync.Mutex
-	client *bond.Client
+	client *bond.Client // set in server mode
+	dir    *direct      // set in no-server mode
 	tun    *tunStack
 	cbs    Callbacks
 	port   string
@@ -41,12 +42,23 @@ func ServerHost(code string) string {
 }
 
 // Start begins tunnelling. tunFd is the VPN interface descriptor; ownership
-// passes to this library.
+// passes to this library. An empty code selects no-server mode: every new
+// connection goes straight out over one of the networks, in turn.
 func Start(tunFd int32, mtu int32, code string, cb Callbacks) error {
 	mu.Lock()
 	defer mu.Unlock()
-	if client != nil {
+	if client != nil || dir != nil {
 		return errors.New("already running")
+	}
+	if code == "" {
+		d := newDirect(cb)
+		t, err := newTunStack(int(tunFd), int(mtu), d, func(f string, a ...any) { cb.Log(fmt.Sprintf(f, a...)) })
+		if err != nil {
+			syscall.Close(int(tunFd))
+			return err
+		}
+		dir, tun, cbs = d, t, cb
+		return nil
 	}
 	secret, _, p, err := bond.ParseCode(code)
 	if err != nil {
@@ -55,7 +67,7 @@ func Start(tunFd int32, mtu int32, code string, cb Callbacks) error {
 	}
 	logf := func(f string, a ...any) { cb.Log(fmt.Sprintf(f, a...)) }
 	c := bond.NewClient(secret, logf)
-	t, err := newTunStack(int(tunFd), int(mtu), c, logf)
+	t, err := newTunStack(int(tunFd), int(mtu), bonded{c}, logf)
 	if err != nil {
 		c.Close()
 		syscall.Close(int(tunFd))
@@ -69,8 +81,12 @@ func Start(tunFd int32, mtu int32, code string, cb Callbacks) error {
 // address as resolved on that network.
 func AddLink(id, name, serverIP string) {
 	mu.Lock()
-	c, cb, p := client, cbs, port
+	c, d, cb, p := client, dir, cbs, port
 	mu.Unlock()
+	if d != nil {
+		d.addLink(id, name)
+		return
+	}
 	if c == nil {
 		return
 	}
@@ -93,8 +109,11 @@ func AddLink(id, name, serverIP string) {
 // RemoveLink stops the link for a network that went away.
 func RemoveLink(id string) {
 	mu.Lock()
-	c := client
+	c, d := client, dir
 	mu.Unlock()
+	if d != nil {
+		d.removeLink(id)
+	}
 	if c != nil {
 		c.RemoveLink(id)
 	}
@@ -103,7 +122,7 @@ func RemoveLink(id string) {
 // Stats returns JSON: {"links":[{id,name,up,rtt,tx,rx}],"streams":n}.
 func Stats() string {
 	mu.Lock()
-	c := client
+	c, d := client, dir
 	mu.Unlock()
 	out := struct {
 		Links   []bond.LinkStat `json:"links"`
@@ -113,6 +132,9 @@ func Stats() string {
 		out.Links = c.Stats()
 		out.Streams = c.NumStreams()
 	}
+	if d != nil {
+		out.Links, out.Streams = d.stats()
+	}
 	b, _ := json.Marshal(out)
 	return string(b)
 }
@@ -120,9 +142,12 @@ func Stats() string {
 // Stop shuts everything down.
 func Stop() {
 	mu.Lock()
-	c, t := client, tun
-	client, tun, cbs = nil, nil, nil
+	c, d, t := client, dir, tun
+	client, dir, tun, cbs = nil, nil, nil, nil
 	mu.Unlock()
+	if d != nil {
+		d.close()
+	}
 	if c != nil {
 		c.Close()
 	}

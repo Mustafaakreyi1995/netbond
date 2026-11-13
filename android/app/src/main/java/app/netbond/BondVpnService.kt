@@ -66,15 +66,17 @@ class BondVpnService : VpnService(), Callbacks {
     private val callbacks = ArrayList<ConnectivityManager.NetworkCallback>()
     private val worker = Executors.newSingleThreadExecutor()
     private var host = ""
+    private var direct = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             shutdown()
             return START_NOT_STICKY
         }
+        val prefs = getSharedPreferences("netbond", Context.MODE_PRIVATE)
+        // an empty code means no-server mode
         val code = intent?.getStringExtra(EXTRA_CODE)
-            ?: getSharedPreferences("netbond", Context.MODE_PRIVATE).getString("code", "")
-            ?: ""
+            ?: if (prefs.getBoolean("useServer", false)) prefs.getString("code", "") ?: "" else ""
         startForegroundNow()
         if (running) return START_STICKY
         try {
@@ -88,8 +90,9 @@ class BondVpnService : VpnService(), Callbacks {
     }
 
     private fun startTunnel(code: String) {
-        host = Mobile.serverHost(code)
-        if (host.isEmpty()) throw IllegalArgumentException("the connection code is not valid")
+        direct = code.isEmpty()
+        host = if (direct) "" else Mobile.serverHost(code)
+        if (!direct && host.isEmpty()) throw IllegalArgumentException("the connection code is not valid")
 
         val builder = Builder()
             .setSession("NetBond")
@@ -108,7 +111,7 @@ class BondVpnService : VpnService(), Callbacks {
             ?: throw IllegalStateException("VPN permission was not granted")
         Mobile.start(pfd.detachFd(), MTU, code, this)
         running = true
-        addLog("VPN started, server $host")
+        addLog(if (direct) "VPN started, no-server mode" else "VPN started, server $host")
 
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         for (t in transports) {
@@ -142,9 +145,13 @@ class BondVpnService : VpnService(), Callbacks {
         }
     }
 
-    /** Resolve the server on this particular network, then start the link. */
+    /** Start using this network; in server mode, resolve the server on it first. */
     private fun attach(t: Transport, network: Network) {
         if (!running || networks[t.id] != network) return
+        if (direct) {
+            Mobile.addLink(t.id, t.label, "")
+            return
+        }
         try {
             val addrs = network.getAllByName(host)
             val addr = addrs.firstOrNull { it is Inet4Address } ?: addrs.first()

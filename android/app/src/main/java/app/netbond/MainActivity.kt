@@ -12,9 +12,11 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import app.netbond.core.mobile.Mobile
@@ -30,6 +32,9 @@ class MainActivity : Activity() {
     private lateinit var code: EditText
     private lateinit var links: LinearLayout
     private lateinit var log: TextView
+    private lateinit var useServer: Switch
+    private lateinit var serverBox: View
+    private lateinit var modeHint: TextView
 
     private val handler = Handler(Looper.getMainLooper())
     private val prev = HashMap<String, LongArray>() // id -> [tx, rx]
@@ -53,8 +58,18 @@ class MainActivity : Activity() {
         links = findViewById(R.id.links)
         log = findViewById(R.id.log)
 
+        useServer = findViewById(R.id.useServer)
+        serverBox = findViewById(R.id.serverBox)
+        modeHint = findViewById(R.id.modeHint)
+
         val prefs = getSharedPreferences("netbond", Context.MODE_PRIVATE)
         code.setText(prefs.getString("code", ""))
+        useServer.isChecked = prefs.getBoolean("useServer", false)
+        showMode()
+        useServer.setOnCheckedChangeListener { _, on ->
+            prefs.edit().putBoolean("useServer", on).apply()
+            showMode()
+        }
 
         findViewById<Button>(R.id.paste).setOnClickListener {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -79,9 +94,23 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showMode() {
+        val on = useServer.isChecked
+        serverBox.visibility = if (on) View.VISIBLE else View.GONE
+        modeHint.text = if (on) {
+            "Every connection is split across all networks"
+        } else {
+            "Off: each new connection takes one network in turn"
+        }
+    }
+
+    /** The code to start with: empty means no-server mode. */
+    private fun activeCode(): String =
+        if (useServer.isChecked) code.text.toString().trim() else ""
+
     private fun connect() {
         val c = code.text.toString().trim()
-        if (Mobile.serverHost(c).isEmpty()) {
+        if (useServer.isChecked && Mobile.serverHost(c).isEmpty()) {
             Toast.makeText(this, "Paste the connection code from your server first", Toast.LENGTH_LONG).show()
             return
         }
@@ -104,7 +133,7 @@ class MainActivity : Activity() {
     private fun startVpn() {
         val i = Intent(this, BondVpnService::class.java)
             .setAction(BondVpnService.ACTION_START)
-            .putExtra(BondVpnService.EXTRA_CODE, code.text.toString().trim())
+            .putExtra(BondVpnService.EXTRA_CODE, activeCode())
         startForegroundService(i)
     }
 
@@ -136,6 +165,7 @@ class MainActivity : Activity() {
         toggle.setBackgroundResource(if (on) R.drawable.btn_disconnect else R.drawable.btn_connect)
         toggle.setTextColor(getColor(if (on) R.color.danger else R.color.bg))
         code.isEnabled = !on
+        useServer.isEnabled = !on
         log.text = BondVpnService.logText()
 
         if (!on) {
@@ -154,6 +184,7 @@ class MainActivity : Activity() {
         var totalDown = 0L
         var totalUp = 0L
         var upCount = 0
+        val direct = !useServer.isChecked
         links.removeAllViews()
         try {
             val arr = JSONObject(Mobile.stats()).getJSONArray("links")
@@ -172,7 +203,11 @@ class MainActivity : Activity() {
                 if (isUp) upCount++
                 addLinkCard(
                     l.getString("name"),
-                    if (isUp) "Connected · ${l.getLong("rtt")} ms" else "Connecting…",
+                    when {
+                        !isUp -> "Connecting…"
+                        direct -> "Active"
+                        else -> "Connected · ${l.getLong("rtt")} ms"
+                    },
                     isUp,
                     "↓ ${mbps(dRx, dt)}   ↑ ${mbps(dTx, dt)}",
                     "${size(rx)} down · ${size(tx)} up"
@@ -183,9 +218,9 @@ class MainActivity : Activity() {
         down.text = mbps(totalDown, dt)
         up.text = mbps(totalUp, dt)
         status.text = when (upCount) {
-            0 -> "Connecting…"
-            1 -> "On · 1 connection in use"
-            else -> "On · $upCount connections combined"
+            0 -> if (direct) "On · waiting for a network" else "Connecting…"
+            1 -> "On · 1 network in use"
+            else -> if (direct) "On · sharing across $upCount networks" else "On · $upCount networks combined"
         }
     }
 

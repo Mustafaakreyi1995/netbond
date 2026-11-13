@@ -32,11 +32,18 @@ const nicID = 1
 type tunStack struct {
 	fd   int
 	s    *stack.Stack
-	c    *bond.Client
+	tr   transport
 	logf func(string, ...any)
 }
 
-func newTunStack(fd, mtu int, c *bond.Client, logf func(string, ...any)) (*tunStack, error) {
+// transport carries the flows that arrive on the VPN interface: either
+// through the bonded server session or straight out over one network.
+type transport interface {
+	serveTCP(conn *gonet.TCPConn, dst netip.AddrPort)
+	serveUDP(conn *gonet.UDPConn, dst netip.AddrPort)
+}
+
+func newTunStack(fd, mtu int, tr transport, logf func(string, ...any)) (*tunStack, error) {
 	if err := syscall.SetNonblock(fd, true); err != nil {
 		return nil, err
 	}
@@ -52,7 +59,7 @@ func newTunStack(fd, mtu int, c *bond.Client, logf func(string, ...any)) (*tunSt
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
-	t := &tunStack{fd: fd, s: s, c: c, logf: logf}
+	t := &tunStack{fd: fd, s: s, tr: tr, logf: logf}
 
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
@@ -121,15 +128,7 @@ func (t *tunStack) handleTCP(r *tcp.ForwarderRequest) {
 	intvl := tcpip.KeepaliveIntervalOption(30 * time.Second)
 	ep.SetSockOpt(&intvl)
 	ep.SetSockOptInt(tcpip.KeepaliveCountOption, 9)
-	conn := gonet.NewTCPConn(&wq, ep)
-	go func() {
-		st, err := t.c.DialTCP(net.JoinHostPort(dst.Addr().String(), strconv.Itoa(int(dst.Port()))))
-		if err != nil {
-			conn.Close()
-			return
-		}
-		bond.Relay(st, conn)
-	}()
+	go t.tr.serveTCP(gonet.NewTCPConn(&wq, ep), dst)
 }
 
 func (t *tunStack) handleUDP(r *udp.ForwarderRequest) {
@@ -143,12 +142,31 @@ func (t *tunStack) handleUDP(r *udp.ForwarderRequest) {
 	if e != nil {
 		return
 	}
-	conn := gonet.NewUDPConn(&wq, ep)
-	u := t.c.DialUDP()
-	idle := 60 * time.Second
+	go t.tr.serveUDP(gonet.NewUDPConn(&wq, ep), dst)
+}
+
+func udpIdle(dst netip.AddrPort) time.Duration {
 	if dst.Port() == 53 {
-		idle = 10 * time.Second
+		return 10 * time.Second
 	}
+	return 60 * time.Second
+}
+
+// bonded sends everything through the server session.
+type bonded struct{ c *bond.Client }
+
+func (b bonded) serveTCP(conn *gonet.TCPConn, dst netip.AddrPort) {
+	st, err := b.c.DialTCP(net.JoinHostPort(dst.Addr().String(), strconv.Itoa(int(dst.Port()))))
+	if err != nil {
+		conn.Close()
+		return
+	}
+	bond.Relay(st, conn)
+}
+
+func (b bonded) serveUDP(conn *gonet.UDPConn, dst netip.AddrPort) {
+	u := b.c.DialUDP()
+	idle := udpIdle(dst)
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
 	since := func() time.Duration { return time.Duration(time.Now().UnixNano() - last.Load()) }
@@ -173,24 +191,23 @@ func (t *tunStack) handleUDP(r *udp.ForwarderRequest) {
 			}
 		}
 	}()
-	go func() { // server -> app
-		defer conn.Close()
-		defer u.Close()
-		for {
-			select {
-			case <-done:
-				return
-			default:
-			}
-			data, _, err := u.ReadFrom(2 * time.Second)
-			if err == bond.ErrTimeout {
-				continue
-			}
-			if err != nil {
-				return
-			}
-			last.Store(time.Now().UnixNano())
-			conn.Write(data)
+	// server -> app
+	defer conn.Close()
+	defer u.Close()
+	for {
+		select {
+		case <-done:
+			return
+		default:
 		}
-	}()
+		data, _, err := u.ReadFrom(2 * time.Second)
+		if err == bond.ErrTimeout {
+			continue
+		}
+		if err != nil {
+			return
+		}
+		last.Store(time.Now().UnixNano())
+		conn.Write(data)
+	}
 }
