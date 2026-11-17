@@ -205,7 +205,10 @@ class MainActivity : Activity() {
                     l.getString("name"),
                     when {
                         !isUp -> "Connecting…"
-                        direct -> "Active"
+                        direct -> {
+                            val n = l.optLong("conns")
+                            if (n == 1L) "1 connection" else "$n connections"
+                        }
                         else -> "Connected · ${l.getLong("rtt")} ms"
                     },
                     isUp,

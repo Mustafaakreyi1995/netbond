@@ -28,6 +28,7 @@ type direct struct {
 	rr     uint64
 	closed bool
 	conns  map[io.Closer]struct{}
+	stop   chan struct{}
 }
 
 type dlink struct {
@@ -35,18 +36,82 @@ type dlink struct {
 	active   atomic.Int64 // open connections
 	tx, rx   atomic.Uint64
 	fails    atomic.Int64 // consecutive dial failures
+
+	// speed is the best throughput seen on this link in bytes/s, decaying
+	// slowly while the link is in use so it follows real changes. 0 means
+	// not yet known.
+	speed  atomic.Int64
+	sample uint64 // tx+rx at the previous sample (sampler goroutine only)
 }
 
+const (
+	sampleEvery = time.Second
+	// per-second decay while busy: halves in about 3.5 minutes
+	speedDecay = 0.9967
+)
+
 func newDirect(cb Callbacks) *direct {
-	return &direct{cb: cb, links: map[string]*dlink{}, conns: map[io.Closer]struct{}{}}
+	d := &direct{cb: cb, links: map[string]*dlink{}, conns: map[io.Closer]struct{}{}, stop: make(chan struct{})}
+	go d.sampler()
+	return d
 }
 
 func (d *direct) addLink(id, name string) {
 	d.mu.Lock()
 	if !d.closed {
-		d.links[id] = &dlink{id: id, name: name}
+		if old := d.links[id]; old != nil {
+			// same network type reconnected: keep what we learned
+			old.name = name
+			old.fails.Store(0)
+		} else {
+			d.links[id] = &dlink{id: id, name: name}
+		}
 	}
 	d.mu.Unlock()
+}
+
+// setHint seeds the speed of a link that has not been measured yet, from
+// Android's own estimate (kilobits per second).
+func (d *direct) setHint(id string, kbps int64) {
+	d.mu.Lock()
+	l := d.links[id]
+	d.mu.Unlock()
+	if l == nil || kbps <= 0 {
+		return
+	}
+	// Android reports radio/link rates, well above what the internet behind
+	// them delivers; a third is a fair first guess until we measure.
+	l.speed.CompareAndSwap(0, kbps*1000/8/3)
+}
+
+func (d *direct) sampler() {
+	t := time.NewTicker(sampleEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-t.C:
+		}
+		d.mu.Lock()
+		ls := make([]*dlink, 0, len(d.links))
+		for _, l := range d.links {
+			ls = append(ls, l)
+		}
+		d.mu.Unlock()
+		for _, l := range ls {
+			total := l.tx.Load() + l.rx.Load()
+			rate := int64(total - l.sample)
+			l.sample = total
+			cur := l.speed.Load()
+			switch {
+			case rate > cur:
+				l.speed.Store(rate)
+			case l.active.Load() > 0 && cur > 0:
+				l.speed.Store(int64(float64(cur) * speedDecay))
+			}
+		}
+	}
 }
 
 func (d *direct) removeLink(id string) {
@@ -57,6 +122,9 @@ func (d *direct) removeLink(id string) {
 
 func (d *direct) close() {
 	d.mu.Lock()
+	if !d.closed {
+		close(d.stop)
+	}
 	d.closed = true
 	d.links = map[string]*dlink{}
 	cs := make([]io.Closer, 0, len(d.conns))
@@ -92,15 +160,19 @@ func (d *direct) stats() ([]bond.LinkStat, int) {
 	out := make([]bond.LinkStat, 0, len(d.links))
 	n := 0
 	for _, l := range d.links {
-		out = append(out, bond.LinkStat{ID: l.id, Name: l.name, Up: true, Tx: l.tx.Load(), Rx: l.rx.Load()})
+		out = append(out, bond.LinkStat{ID: l.id, Name: l.name, Up: true, Tx: l.tx.Load(), Rx: l.rx.Load(),
+			Conns: l.active.Load(), Speed: l.speed.Load()})
 		n += int(l.active.Load())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, n
 }
 
-// order returns the links to try for a new flow: fewest open connections
-// first, rotating among equals, with recently failing links last.
+// order returns the links to try for a new flow, best first. A link's
+// score is its speed divided by the connections already on it, so a link
+// twice as fast takes about twice the connections and a big download is far
+// more likely to land on the faster network. Unmeasured links count as
+// average so they get tried; links that keep failing go last.
 func (d *direct) order() []*dlink {
 	d.mu.Lock()
 	ls := make([]*dlink, 0, len(d.links))
@@ -113,14 +185,34 @@ func (d *direct) order() []*dlink {
 	sort.Slice(ls, func(i, j int) bool { return ls[i].id < ls[j].id })
 	if n := len(ls); n > 1 {
 		k := int(rr % uint64(n))
-		ls = append(ls[k:], ls[:k]...)
+		ls = append(ls[k:], ls[:k]...) // rotate so ties alternate
+	}
+
+	var sum, known int64
+	for _, l := range ls {
+		if v := l.speed.Load(); v > 0 {
+			sum += v
+			known++
+		}
+	}
+	avg := int64(1 << 20)
+	if known > 0 {
+		avg = sum / known
+	}
+	score := make(map[*dlink]float64, len(ls))
+	for _, l := range ls {
+		v := l.speed.Load()
+		if v <= 0 {
+			v = avg
+		}
+		score[l] = float64(v) / float64(l.active.Load()+1)
 	}
 	sort.SliceStable(ls, func(i, j int) bool {
 		fi, fj := ls[i].fails.Load() > 2, ls[j].fails.Load() > 2
 		if fi != fj {
 			return !fi
 		}
-		return ls[i].active.Load() < ls[j].active.Load()
+		return score[ls[i]] > score[ls[j]]
 	})
 	return ls
 }
@@ -189,7 +281,7 @@ func (d *direct) serveTCP(conn *gonet.TCPConn, dst netip.AddrPort) {
 }
 
 func copyCount(dst io.Writer, src io.Reader, n *atomic.Uint64) {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, 256*1024)
 	for {
 		k, err := src.Read(buf)
 		if k > 0 {

@@ -106,6 +106,17 @@ func AddLink(id, name, serverIP string) {
 	})
 }
 
+// SetLinkHint passes Android's bandwidth estimate for a network (kbps), used
+// to place connections before the link's real speed has been measured.
+func SetLinkHint(id string, kbps int64) {
+	mu.Lock()
+	d := dir
+	mu.Unlock()
+	if d != nil {
+		d.setHint(id, kbps)
+	}
+}
+
 // RemoveLink stops the link for a network that went away.
 func RemoveLink(id string) {
 	mu.Lock()

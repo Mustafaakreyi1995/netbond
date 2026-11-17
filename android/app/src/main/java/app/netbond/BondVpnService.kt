@@ -36,7 +36,10 @@ class BondVpnService : VpnService(), Callbacks {
         const val EXTRA_CODE = "code"
         private const val CHANNEL = "vpn"
         private const val NOTIF_ID = 1
-        private const val MTU = 1500
+        // Bigger than a real network's 1500: packets on the VPN interface never
+        // leave the phone as-is, and fewer, larger packets make the VPN path
+        // several times cheaper. 9000 is what most Android VPNs use.
+        private const val MTU = 9000
 
         @Volatile
         var running = false
@@ -150,6 +153,9 @@ class BondVpnService : VpnService(), Callbacks {
         if (!running || networks[t.id] != network) return
         if (direct) {
             Mobile.addLink(t.id, t.label, "")
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val kbps = cm.getNetworkCapabilities(network)?.linkDownstreamBandwidthKbps ?: 0
+            if (kbps > 0) Mobile.setLinkHint(t.id, kbps.toLong())
             return
         }
         try {

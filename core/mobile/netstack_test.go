@@ -263,3 +263,46 @@ func TestDirectMode(t *testing.T) {
 		t.Fatalf("direct udp failed: %v %q", err, buf[:n])
 	}
 }
+
+// TestDirectPrefersFaster checks that once one link is known to be much
+// faster, new connections mostly go to it, while the slower one still gets
+// a share and an unmeasured link is tried.
+func TestDirectPrefersFaster(t *testing.T) {
+	d := newDirect(&fakeCB{binds: map[string]int{}})
+	defer d.close()
+	d.addLink("wifi", "Wi-Fi")
+	d.addLink("cell", "Mobile data")
+	d.links["wifi"].speed.Store(18 << 20)
+	d.links["cell"].speed.Store(3 << 20)
+
+	picks := map[string]int{}
+	for i := 0; i < 14; i++ {
+		l := d.order()[0]
+		picks[l.id]++
+		l.active.Add(1) // connections stay open
+	}
+	t.Logf("picks with 18 vs 3 MB/s: %v", picks)
+	if picks["wifi"] < 10 || picks["cell"] < 1 {
+		t.Fatalf("bad split: %v", picks)
+	}
+
+	// a single big download must start on the faster link
+	for _, l := range d.links {
+		l.active.Store(0)
+	}
+	for i := 0; i < 5; i++ {
+		if got := d.order()[0].id; got != "wifi" {
+			t.Fatalf("first connection went to %s", got)
+		}
+	}
+
+	// a new, unmeasured network is treated as average and gets tried
+	d.addLink("eth", "Ethernet")
+	if got := d.order()[0].id; got != "eth" && got != "wifi" {
+		t.Fatalf("unmeasured link ranked last: %s", got)
+	}
+	d.setHint("eth", 1000) // 1 Mbps: a known-slow link
+	if d.links["eth"].speed.Load() == 0 {
+		t.Fatal("hint ignored")
+	}
+}

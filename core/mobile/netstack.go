@@ -67,9 +67,9 @@ func newTunStack(fd, mtu int, tr transport, logf func(string, ...any)) (*tunStac
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &mod)
 	cc := tcpip.CongestionControlOption("cubic")
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
-	snd := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: tcp.MaxBufferSize}
+	snd := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: 4 << 20, Max: 8 << 20}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd)
-	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: tcp.MaxBufferSize}
+	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: 1 << 20, Max: 8 << 20}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv)
 
 	tcpFwd := tcp.NewForwarder(s, 0, 2048, t.handleTCP)

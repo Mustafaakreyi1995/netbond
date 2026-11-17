@@ -28,6 +28,8 @@ type LinkStat struct {
 	RTTms int64  `json:"rtt"`
 	Tx    uint64 `json:"tx"`
 	Rx    uint64 `json:"rx"`
+	Conns int64  `json:"conns,omitempty"` // open connections (no-server mode)
+	Speed int64  `json:"speed,omitempty"` // best measured bytes/s (no-server mode)
 }
 
 type link struct {
